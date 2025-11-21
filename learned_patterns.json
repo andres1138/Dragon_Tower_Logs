@@ -1,0 +1,120 @@
+{
+  "patterns": [
+    {
+      "pattern": "RRLLLLRRR",
+      "timestamp": "2025-11-21T11:14:10.453652"
+    },
+    {
+      "pattern": "LRLRLLLRL",
+      "timestamp": "2025-11-21T11:14:36.261726"
+    },
+    {
+      "pattern": "LRLLLLRRL",
+      "timestamp": "2025-11-21T11:14:52.733178"
+    },
+    {
+      "pattern": "LRRLLLLLL",
+      "timestamp": "2025-11-21T11:16:23.408155"
+    },
+    {
+      "pattern": "LLRLRLLLR",
+      "timestamp": "2025-11-21T11:16:41.209816"
+    },
+    {
+      "pattern": "RRLLLLLLR",
+      "timestamp": "2025-11-21T11:17:06.339002"
+    },
+    {
+      "pattern": "RLRLLRLRR",
+      "timestamp": "2025-11-21T11:17:34.374347"
+    },
+    {
+      "pattern": "LRRLLRRRR",
+      "timestamp": "2025-11-21T11:17:49.606902"
+    },
+    {
+      "pattern": "LLLRRRRRL",
+      "timestamp": "2025-11-21T11:18:04.682647"
+    },
+    {
+      "pattern": "LRLRLLLLL",
+      "timestamp": "2025-11-21T11:18:19.599931"
+    },
+    {
+      "pattern": "LLRLRLRLR",
+      "timestamp": "2025-11-21T11:18:44.980033"
+    },
+    {
+      "pattern": "RRLLLRRRR",
+      "timestamp": "2025-11-21T11:19:04.892635"
+    },
+    {
+      "pattern": "LRLRRLRRL",
+      "timestamp": "2025-11-21T11:20:33.859598"
+    },
+    {
+      "pattern": "RLLRLRLRL",
+      "timestamp": "2025-11-21T11:21:51.575985"
+    },
+    {
+      "pattern": "LRRRRLLRR",
+      "timestamp": "2025-11-21T11:22:13.626202"
+    },
+    {
+      "pattern": "RRRRLLRRR",
+      "timestamp": "2025-11-21T11:22:34.078494"
+    },
+    {
+      "pattern": "RLLRRRRRL",
+      "timestamp": "2025-11-21T11:23:12.554735"
+    },
+    {
+      "pattern": "LLLRRRLRL",
+      "timestamp": "2025-11-21T11:23:23.153480"
+    },
+    {
+      "pattern": "RRRLLRRLR",
+      "timestamp": "2025-11-21T11:23:39.734176"
+    },
+    {
+      "pattern": "LRRRRLLRR",
+      "timestamp": "2025-11-21T11:23:52.582972"
+    },
+    {
+      "pattern": "LRLRLLRLR",
+      "timestamp": "2025-11-21T11:24:12.270352"
+    },
+    {
+      "pattern": "RRRRLRLRL",
+      "timestamp": "2025-11-21T11:24:38.055992"
+    },
+    {
+      "pattern": "RLRLLRRLL",
+      "timestamp": "2025-11-21T11:25:00.600972"
+    }
+  ],
+  "pattern_counts": {
+    "RRLLLLRRR": 1,
+    "LRLRLLLRL": 1,
+    "LRLLLLRRL": 1,
+    "LRRLLLLLL": 1,
+    "LLRLRLLLR": 1,
+    "RRLLLLLLR": 1,
+    "RLRLLRLRR": 1,
+    "LRRLLRRRR": 1,
+    "LLLRRRRRL": 1,
+    "LRLRLLLLL": 1,
+    "LLRLRLRLR": 1,
+    "RRLLLRRRR": 1,
+    "LRLRRLRRL": 1,
+    "RLLRLRLRL": 1,
+    "LRRRRLLRR": 2,
+    "RRRRLLRRR": 1,
+    "RLLRRRRRL": 1,
+    "LLLRRRLRL": 1,
+    "RRRLLRRLR": 1,
+    "LRLRLLRLR": 1,
+    "RRRRLRLRL": 1,
+    "RLRLLRRLL": 1
+  }
+}
