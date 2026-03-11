@@ -118,6 +118,14 @@ def save_game_to_csv(game_sequence, games_count):
 
 
 # ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def hamming_distance(a, b):
+    """Count how many positions differ between two equal-length sequences."""
+    return sum(x != y for x, y in zip(a, b))
+
+
+# ─────────────────────────────────────────────
 # ANALYSIS ENGINE
 # ─────────────────────────────────────────────
 class DragonTowerAnalyzer:
@@ -133,6 +141,25 @@ class DragonTowerAnalyzer:
         for row in range(NUM_ROWS):
             left_count = sum(1 for g in self.games if g[row] == 0)
             self.row_bias[row] = left_count / self.num_games if self.num_games > 0 else 0.5
+
+        # Recent-trend bias: row bias from last 50 games only
+        recent_n = min(50, self.num_games)
+        recent_games = self.games[-recent_n:] if recent_n > 0 else []
+        self.recent_row_bias = [0.0] * NUM_ROWS
+        for row in range(NUM_ROWS):
+            if recent_games:
+                left_count = sum(1 for g in recent_games if g[row] == 0)
+                self.recent_row_bias[row] = left_count / len(recent_games)
+            else:
+                self.recent_row_bias[row] = 0.5
+
+        # Streak avoidance: P(alternation) per row transition
+        # How often does the side change from row to row+1?
+        self.alternation_rate = [0.5] * (NUM_ROWS - 1)
+        for row in range(NUM_ROWS - 1):
+            if self.num_games > 0:
+                alt_count = sum(1 for g in self.games if g[row] != g[row + 1])
+                self.alternation_rate[row] = alt_count / self.num_games
 
         # Transition probabilities: P(next | current)
         # transition_probs[current_side][row] = P(next_row = 0 | current_row = current_side)
@@ -200,10 +227,12 @@ class DragonTowerAnalyzer:
         pattern_freq = Counter(matching)
         return pattern_freq.most_common(top_n)
 
-    def get_fused_prediction(self, prefix):
+    def get_fused_prediction(self, prefix, last_games=None):
         """
         Multi-signal fusion prediction for the next row.
-        Combines: prefix matching, row bias, transition probability, pattern weighting.
+        Combines: prefix matching, row bias, transition probability, pattern weighting,
+        recent trend, streak avoidance, last-game similarity, and session recency.
+        last_games: optional list of recently completed full 9-row patterns from this session.
         Returns (prob_left, confidence, signals_dict).
         """
         next_row = len(prefix)
@@ -214,16 +243,17 @@ class DragonTowerAnalyzer:
         weights = {}
 
         # Signal 1: Conditional probability from prefix matching (STRONGEST)
+        # BUT: when prefix is empty, this matches ALL games and is identical to row_bias,
+        # so we skip it to avoid double-counting the same information.
         cond_prob, num_matches, _ = self.get_conditional_prob(prefix)
         signals["prefix_match"] = cond_prob
-        # Weight by number of matches (more matches = more reliable)
-        # Minimum weight of 1, scales up with matches
-        if num_matches > 0:
+        if len(prefix) > 0 and num_matches > 0:
             weights["prefix_match"] = min(5.0, 1.0 + math.log2(max(1, num_matches)))
         else:
+            # Empty prefix: prefix_match == row_bias, don't double-count
             weights["prefix_match"] = 0.0
 
-        # Signal 2: Row bias
+        # Signal 2: Row bias (all-time)
         row_prob = self.get_row_bias(next_row)
         signals["row_bias"] = row_prob
         weights["row_bias"] = 1.0
@@ -239,7 +269,7 @@ class DragonTowerAnalyzer:
 
         # Signal 4: Pattern frequency weighting
         # Check if remaining possible patterns lean one way
-        if num_matches >= 3:
+        if num_matches >= 3 and len(prefix) > 0:
             top_patterns = self.get_top_patterns_for_prefix(prefix, top_n=10)
             pattern_left = 0
             pattern_total = 0
@@ -256,6 +286,70 @@ class DragonTowerAnalyzer:
             signals["pattern_freq"] = 0.5
             weights["pattern_freq"] = 0.0
 
+        # Signal 5: Recent trend (last 50 games)
+        # Adds temporal awareness — recent games may differ from all-time averages
+        recent_prob = self.recent_row_bias[next_row]
+        signals["recent_trend"] = recent_prob
+        # Give more weight when it disagrees with all-time bias (signals a shift)
+        trend_divergence = abs(recent_prob - row_prob)
+        weights["recent_trend"] = 0.8 + trend_divergence * 2.0
+
+        # Signal 6: Streak avoidance
+        # If we have prior rows, use alternation rate to bias away from long same-side streaks
+        if len(prefix) > 0 and next_row < NUM_ROWS:
+            alt_rate = self.alternation_rate[next_row - 1]
+            last_side = prefix[-1]
+            # If alternation is common, predict the opposite of last side
+            if last_side == 0:
+                # Last was Left; if alternation is high, predict Right (prob_left goes down)
+                signals["streak_avoid"] = 1.0 - alt_rate
+            else:
+                # Last was Right; if alternation is high, predict Left (prob_left goes up)
+                signals["streak_avoid"] = alt_rate
+            weights["streak_avoid"] = 0.6
+        else:
+            signals["streak_avoid"] = 0.5
+            weights["streak_avoid"] = 0.0
+
+        # Signal 7: Last-game similarity
+        # Find historical games within Hamming distance <= 3 of the last completed game
+        # and use them to predict the current row
+        if last_games and len(last_games) > 0:
+            last_game = last_games[-1]  # Most recent completed game
+            neighbors = [g for g in self.games if hamming_distance(g, last_game) <= 3]
+            if neighbors and next_row < NUM_ROWS:
+                left_count = sum(1 for g in neighbors if g[next_row] == 0)
+                signals["last_game_sim"] = left_count / len(neighbors)
+                # Weight scales with how many neighbors we found
+                weights["last_game_sim"] = min(2.0, 0.8 + math.log2(max(1, len(neighbors))))
+            else:
+                signals["last_game_sim"] = 0.5
+                weights["last_game_sim"] = 0.0
+        else:
+            signals["last_game_sim"] = 0.5
+            weights["last_game_sim"] = 0.0
+
+        # Signal 8: Session recency
+        # If we have multiple session games, strongly weight those specific patterns
+        if last_games and len(last_games) >= 2:
+            session_slice = last_games[-3:]  # Up to last 3 session games
+            # Find historical games that share a prefix with ANY recent session game
+            session_neighbors = []
+            for sg in session_slice:
+                for g in self.games:
+                    if hamming_distance(g, sg) <= 2:
+                        session_neighbors.append(g)
+            if session_neighbors and next_row < NUM_ROWS:
+                left_count = sum(1 for g in session_neighbors if g[next_row] == 0)
+                signals["session_recency"] = left_count / len(session_neighbors)
+                weights["session_recency"] = 1.0
+            else:
+                signals["session_recency"] = 0.5
+                weights["session_recency"] = 0.0
+        else:
+            signals["session_recency"] = 0.5
+            weights["session_recency"] = 0.0
+
         # Weighted average
         total_weight = sum(weights.values())
         if total_weight == 0:
@@ -265,13 +359,24 @@ class DragonTowerAnalyzer:
 
         # Confidence = how far from 50/50 we are, scaled by data quality
         raw_confidence = abs(fused_prob - 0.5) * 2  # 0 to 1
-        data_quality = min(1.0, num_matches / 20) if num_matches > 0 else 0.3
+        # With no prefix, confidence should be very low (no game-specific info)
+        if len(prefix) == 0:
+            data_quality = 0.15
+        elif num_matches > 0:
+            data_quality = min(1.0, num_matches / 20)
+        else:
+            data_quality = 0.3
+        # Boost confidence when session context is active
+        if last_games and len(last_games) > 0:
+            data_quality = min(1.0, data_quality + 0.1)
         confidence = raw_confidence * data_quality
 
         detail = {k: {"prob_left": signals[k], "weight": weights[k]} for k in signals}
         detail["num_matches"] = num_matches
         detail["fused_prob_left"] = fused_prob
         detail["confidence"] = confidence
+        if last_games:
+            detail["session_games_count"] = len(last_games)
 
         return fused_prob, confidence, detail
 
@@ -377,14 +482,14 @@ def display_tower(prefix, predictions=None):
     print(f"  {'':>6}   LEFT  RIGHT")
 
 
-def display_prediction(analyzer, prefix):
+def display_prediction(analyzer, prefix, last_games=None):
     """Display the AI's prediction for the next row."""
     next_row = len(prefix)
     if next_row >= NUM_ROWS:
         print(f"\n  {C.GREEN}{C.BOLD}🎉 All 9 rows revealed! Full pattern complete.{C.RESET}")
         return
 
-    prob_left, confidence, detail = analyzer.get_fused_prediction(prefix)
+    prob_left, confidence, detail = analyzer.get_fused_prediction(prefix, last_games=last_games)
     num_matches = detail.get("num_matches", 0)
 
     print_subheader(f"PREDICTION FOR ROW {next_row + 1}")
@@ -397,17 +502,28 @@ def display_prediction(analyzer, prefix):
         recommended = 1
         rec_prob = 1 - prob_left
 
-    print(f"\n  {C.BOLD}Recommendation: {format_side(recommended, rec_prob)}{C.RESET}")
+    # Show coin-flip warning when prediction is very close to 50/50
+    near_coin_flip = 0.48 <= prob_left <= 0.52
+    if near_coin_flip:
+        print(f"\n  {C.YELLOW}{C.BOLD}⚠  NEAR COIN FLIP — No meaningful edge for this row{C.RESET}")
+        print(f"  {C.DIM}The AI sees ~50/50 odds. Either side is equally likely.{C.RESET}")
+        print(f"\n  {C.BOLD}Leaning:         {format_side(recommended, rec_prob)}{C.RESET}")
+    else:
+        print(f"\n  {C.BOLD}Recommendation: {format_side(recommended, rec_prob)}{C.RESET}")
     print(f"  Confidence:    {format_confidence_bar(confidence)}")
     print(f"  Matching games: {C.BOLD}{num_matches}{C.RESET} / {analyzer.num_games}")
 
     # Signal breakdown
     print(f"\n  {C.DIM}Signal breakdown:{C.RESET}")
-    for signal_name in ["prefix_match", "row_bias", "transition", "pattern_freq"]:
+    signal_names = ["prefix_match", "row_bias", "recent_trend", "transition",
+                    "pattern_freq", "streak_avoid", "last_game_sim", "session_recency"]
+    for signal_name in signal_names:
         if signal_name in detail and isinstance(detail[signal_name], dict):
             info = detail[signal_name]
             prob = info["prob_left"]
             weight = info["weight"]
+            if weight == 0.0:
+                continue  # Don't show inactive signals
             side = "LEFT" if prob >= 0.5 else "RIGHT"
             dom_prob = prob if prob >= 0.5 else (1 - prob)
             bar_len = int(weight * 4)
@@ -431,6 +547,11 @@ def display_prediction(analyzer, prefix):
                         display += f"{C.DIM}{'L' if s == 0 else 'R'}{C.RESET}"
                 freq = count / analyzer.num_games * 100
                 print(f"    {display}  (seen {count}x, {freq:.1f}%)")
+
+    # Session context info
+    session_count = detail.get("session_games_count", 0)
+    if session_count > 0:
+        print(f"\n  {C.CYAN}🔗 Session context: {session_count} game{'s' if session_count != 1 else ''} in memory{C.RESET}")
 
 
 # ─────────────────────────────────────────────
@@ -626,10 +747,11 @@ def run_interactive(games):
         print(f"    {C.CYAN}2{C.RESET}) 📊  View statistics")
         print(f"    {C.CYAN}3{C.RESET}) 🧪  Run backtest")
         print(f"    {C.CYAN}4{C.RESET}) 🏆  View hot patterns")
-        print(f"    {C.CYAN}5{C.RESET}) 🚪  Exit")
+        print(f"    {C.CYAN}5{C.RESET}) 🔗  Session similarity analysis")
+        print(f"    {C.CYAN}6{C.RESET}) 🚪  Exit")
         print()
 
-        choice = input(f"  {C.BOLD}Enter choice (1-5): {C.RESET}").strip()
+        choice = input(f"  {C.BOLD}Enter choice (1-6): {C.RESET}").strip()
 
         if choice == "1":
             run_game_session(analyzer, games)
@@ -643,6 +765,9 @@ def run_interactive(games):
             show_hot_patterns(analyzer)
             input(f"\n  {C.DIM}Press Enter to continue...{C.RESET}")
         elif choice == "5":
+            run_similarity_analysis(games)
+            input(f"\n  {C.DIM}Press Enter to continue...{C.RESET}")
+        elif choice == "6":
             print(f"\n  {C.CYAN}Good luck on the tower! 🐉{C.RESET}\n")
             break
         else:
@@ -652,23 +777,26 @@ def run_interactive(games):
 
 def run_game_session(analyzer, games):
     """Run a single game prediction session."""
+    session_games = []  # Track completed games this session
     prefix = []
     game_active = True
 
     while game_active:
         clear_screen()
-        print_header(f"LIVE GAME — Row {len(prefix) + 1} of {NUM_ROWS}")
+        session_label = f" (Session game #{len(session_games) + 1})" if session_games else ""
+        print_header(f"LIVE GAME — Row {len(prefix) + 1} of {NUM_ROWS}{session_label}")
 
         # Show current tower
         predictions = {}
+        last_games_ctx = session_games if session_games else None
         if len(prefix) < NUM_ROWS:
-            prob_left, _, _ = analyzer.get_fused_prediction(prefix)
+            prob_left, _, _ = analyzer.get_fused_prediction(prefix, last_games=last_games_ctx)
             predictions["prob_left"] = prob_left
         display_tower(prefix, predictions)
 
         # Show prediction
         if len(prefix) < NUM_ROWS:
-            display_prediction(analyzer, prefix)
+            display_prediction(analyzer, prefix, last_games=last_games_ctx)
 
         if len(prefix) >= NUM_ROWS:
             print(f"\n  {C.GREEN}{C.BOLD}🎉 All 9 rows complete!{C.RESET}")
@@ -682,6 +810,17 @@ def run_game_session(analyzer, games):
             else:
                 print(f"  {C.CYAN}New pattern! Not seen in the database.{C.RESET}")
 
+            # Show similarity to last session game
+            if session_games:
+                dist = hamming_distance(tuple(prefix), session_games[-1])
+                match_count = NUM_ROWS - dist
+                if dist <= 2:
+                    print(f"  {C.GREEN}{C.BOLD}🔗 {match_count}/{NUM_ROWS} rows match previous game! Very similar! 🔥{C.RESET}")
+                elif dist <= 4:
+                    print(f"  {C.YELLOW}🔗 {match_count}/{NUM_ROWS} rows match previous game (somewhat similar){C.RESET}")
+                else:
+                    print(f"  {C.DIM}🔗 {match_count}/{NUM_ROWS} rows match previous game{C.RESET}")
+
             # Offer to save
             print(f"\n  {C.BOLD}Options:{C.RESET}")
             print(f"    {C.CYAN}S{C.RESET}) Save this game to database")
@@ -690,6 +829,7 @@ def run_game_session(analyzer, games):
             choice = input(f"\n  {C.BOLD}Choice: {C.RESET}").strip().upper()
 
             if choice == "S":
+                session_games.append(tuple(prefix))
                 game_num = save_game_to_csv(prefix, len(games))
                 games.append(tuple(prefix))
                 analyzer = DragonTowerAnalyzer(games)
@@ -697,6 +837,7 @@ def run_game_session(analyzer, games):
                 input(f"  {C.DIM}Press Enter to continue...{C.RESET}")
                 prefix = []
             elif choice == "N":
+                session_games.append(tuple(prefix))
                 prefix = []
             else:
                 game_active = False
@@ -792,6 +933,106 @@ def show_hot_patterns(analyzer):
 
 
 # ─────────────────────────────────────────────
+# CONSECUTIVE-GAME SIMILARITY ANALYSIS
+# ─────────────────────────────────────────────
+def run_similarity_analysis(games):
+    """Analyze whether consecutive games have similar patterns."""
+    print_header("CONSECUTIVE-GAME SIMILARITY ANALYSIS")
+    print(f"\n  Analyzing {len(games)} games for session-level pattern similarity...")
+    print(f"  {C.DIM}(Comparing each game to the one that followed it){C.RESET}\n")
+
+    if len(games) < 2:
+        print(f"  {C.RED}Need at least 2 games for comparison.{C.RESET}")
+        return
+
+    # Compute Hamming distances between consecutive games
+    distances = []
+    for i in range(len(games) - 1):
+        d = hamming_distance(games[i], games[i + 1])
+        distances.append(d)
+
+    # Distribution histogram
+    dist_counts = Counter(distances)
+    avg_distance = sum(distances) / len(distances)
+    expected_avg = NUM_ROWS / 2  # 4.5 for 9 rows if truly random and independent
+
+    print_subheader("HAMMING DISTANCE DISTRIBUTION")
+    print(f"  {C.DIM}Distance = how many rows differ between consecutive games{C.RESET}")
+    print(f"  {C.DIM}Lower distance = more similar patterns{C.RESET}\n")
+
+    max_bar = max(dist_counts.values()) if dist_counts else 1
+    for d in range(NUM_ROWS + 1):
+        count = dist_counts.get(d, 0)
+        pct = count / len(distances) * 100
+        bar_len = int(count / max_bar * 30) if max_bar > 0 else 0
+        label = f"  {d} rows differ"
+        color = C.GREEN if d <= 2 else (C.YELLOW if d <= 4 else C.WHITE)
+        print(f"  {label}: {color}{'█' * bar_len}{C.RESET} {count} ({pct:.1f}%)")
+
+    print(f"\n  {C.BOLD}Average Hamming distance:{C.RESET} {avg_distance:.2f}")
+    print(f"  {C.DIM}Expected if random:      {expected_avg:.1f}{C.RESET}")
+
+    # Statistical comparison
+    diff = expected_avg - avg_distance
+    if diff > 0.3:
+        print(f"\n  {C.GREEN}{C.BOLD}✓ Consecutive games are MORE SIMILAR than random! ({diff:.2f} closer){C.RESET}")
+        print(f"  {C.GREEN}  This supports using last-game predictions.{C.RESET}")
+    elif diff > 0.1:
+        print(f"\n  {C.YELLOW}~ Slight similarity trend detected ({diff:.2f} closer than random){C.RESET}")
+        print(f"  {C.YELLOW}  Marginal but worth factoring in.{C.RESET}")
+    else:
+        print(f"\n  {C.DIM}≈ Consecutive games appear close to random (diff: {diff:.2f}){C.RESET}")
+        print(f"  {C.DIM}  Last-game signal may have limited impact.{C.RESET}")
+
+    # Highly similar pairs (distance <= 2)
+    similar_pairs = [(i, i+1, distances[i]) for i in range(len(distances)) if distances[i] <= 2]
+    pct_similar = len(similar_pairs) / len(distances) * 100
+    # Expected: P(hamming <= 2) for two random 9-bit strings
+    # = C(9,0)/512 + C(9,1)/512 + C(9,2)/512 = (1+9+36)/512 = 8.98%
+    expected_pct_similar = (1 + 9 + 36) / (2 ** NUM_ROWS) * 100
+
+    print_subheader("HIGHLY SIMILAR CONSECUTIVE PAIRS (≤2 rows differ)")
+    print(f"  Found: {C.BOLD}{len(similar_pairs)}{C.RESET} pairs ({pct_similar:.1f}%)")
+    print(f"  Expected if random: {expected_pct_similar:.1f}%")
+    if pct_similar > expected_pct_similar * 1.5:
+        print(f"  {C.GREEN}{C.BOLD}🔥 {pct_similar / expected_pct_similar:.1f}x more similar pairs than expected!{C.RESET}")
+    elif pct_similar > expected_pct_similar:
+        print(f"  {C.YELLOW}Slightly elevated ({pct_similar / expected_pct_similar:.1f}x expected){C.RESET}")
+
+    # Show some examples
+    if similar_pairs:
+        print(f"\n  {C.DIM}Examples of highly similar consecutive games:{C.RESET}")
+        for idx, (i, j, d) in enumerate(similar_pairs[:8]):
+            g1 = " ".join("L" if s == 0 else "R" for s in games[i])
+            g2 = " ".join("L" if s == 0 else "R" for s in games[j])
+            match = ""
+            for k in range(NUM_ROWS):
+                if games[i][k] == games[j][k]:
+                    match += f"{C.GREEN}={C.RESET}"
+                else:
+                    match += f"{C.RED}≠{C.RESET}"
+            print(f"    Game {i+1}: {g1}")
+            print(f"    Game {j+1}: {g2}")
+            print(f"    Match:  {match}  (distance: {d})")
+            if idx < len(similar_pairs[:8]) - 1:
+                print()
+
+    # Row-level: are certain rows more likely to repeat?
+    print_subheader("PER-ROW REPEAT RATE (consecutive games)")
+    print(f"  {C.DIM}How often does each row have the same value as the previous game?{C.RESET}")
+    for row in range(NUM_ROWS):
+        same_count = sum(1 for i in range(len(games) - 1) if games[i][row] == games[i+1][row])
+        repeat_rate = same_count / (len(games) - 1) * 100
+        expected_rate = 50.0
+        diff = repeat_rate - expected_rate
+        color = C.GREEN if diff > 3 else (C.YELLOW if diff > 1 else C.DIM)
+        bar = "█" * int(repeat_rate / 2.5)
+        print(f"  Row {row+1}: {color}{bar}{C.RESET} {repeat_rate:.1f}%  {color}({diff:+.1f}% vs random){C.RESET}")
+
+    print()
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 def main():
@@ -814,11 +1055,13 @@ def main():
             run_analysis(games)
         elif "--backtest" in sys.argv:
             run_backtest(games)
+        elif "--similarity" in sys.argv:
+            run_similarity_analysis(games)
         elif "--help" in sys.argv:
             print(__doc__)
         else:
             print(f"Unknown argument: {sys.argv[1]}")
-            print(f"Usage: python3 {sys.argv[0]} [--analyze | --backtest | --help]")
+            print(f"Usage: python3 {sys.argv[0]} [--analyze | --backtest | --similarity | --help]")
     else:
         run_interactive(games)
 
